@@ -1,5 +1,5 @@
 name: skill-utility-prices
-version: 0.1.0
+version: 0.1.1
 description: Electricity contract price-fixing skill. Fetches cnt/kWh prices for monthly, quarterly, and multi-period bundles; persists snapshots to a local SQLite database for historical analysis. Agent-friendly CLI with discoverable schema.
 author: Renalias, Oscar
 dependencies:
