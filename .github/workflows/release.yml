@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    paths-ignore:
+      - 'README.md'
+      - 'CLAUDE.md'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute new version
+        id: version
+        run: |
+          current=$(grep '^version:' apm.yml | awk '{print $2}')
+          IFS='.' read -r major minor patch <<< "$current"
+          patch=$((patch + 1))
+          new="${major}.${minor}.${patch}"
+          echo "version=${new}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${new}" >> "$GITHUB_OUTPUT"
+
+      - name: Update apm.yml
+        run: |
+          sed -i "s/^version: .*/version: ${{ steps.version.outputs.version }}/" apm.yml
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apm.yml
+          git commit -m "chore: release ${{ steps.version.outputs.tag }} [skip ci]"
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin HEAD "${{ steps.version.outputs.tag }}"
+
+      - name: Build package
+        run: |
+          cd .apm/skills && zip -r "../../skill-utility-prices-${{ steps.version.outputs.version }}.zip" \
+            utility-prices \
+            -x "*/__pycache__/*" "*/.venv/*" "*/.env" "*/*.db"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: skill-utility-prices ${{ steps.version.outputs.version }}
+          body: |
+            ## Installation
+
+            **With apm:**
+            ```
+            apm install oscarrenalias/skill-utility-prices#${{ steps.version.outputs.tag }}
+            ```
+
+            **Without apm:** download the zip below and extract it into your `.claude/skills/` folder:
+
+            ```
+            unzip skill-utility-prices-${{ steps.version.outputs.version }}.zip -d ~/.claude/skills/
+            ```
+
+            Then set up the skill folder once:
+            ```
+            cd ~/.claude/skills/utility-prices
+            cp .env.example .env   # edit .env with your PKS Live credentials
+            uv sync
+            ```
+          files: skill-utility-prices-${{ steps.version.outputs.version }}.zip

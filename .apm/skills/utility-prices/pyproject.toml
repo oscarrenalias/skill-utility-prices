@@ -1,0 +1,10 @@
+[project]
+name = "pks"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pycognito>=2024.5.1",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.1",
+    "websocket-client>=1.9.0",
+]
