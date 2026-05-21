@@ -1,5 +1,5 @@
 name: skill-utility-prices
-version: 0.1.1
+version: 0.1.2
 description: PKS Live electricity skill. Fetches price-fixing snapshots (snt/kWh for monthly, quarterly, and multi-period bundles) and metered consumption actuals (daily kWh and EUR with day/night breakdown), and persists both to a local SQLite database for historical analysis. Agent-friendly CLI with discoverable schema.
 author: Renalias, Oscar
 dependencies:
