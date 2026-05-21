@@ -1,6 +1,14 @@
-"""Fetch PKS Live price-fixing data and print to stdout.
+"""PKS Live data fetcher and local SQLite history store.
 
-Requires PKS_USERNAME and PKS_PASSWORD env vars (or --username/--password CLI args).
+Top-level subcommands:
+  prices    Fetch electricity price-fixing snapshots (Cognito + magic-link + SignalR).
+  actuals   Fetch metered consumption history (Cognito + GraphQL only).
+  describe  Emit DB schema and table summaries as JSON.
+  query     Run a read-only SQL query against the DB.
+  runs      List historical price-fixing snapshots.
+
+Requires PKS_USERNAME and PKS_PASSWORD env vars (or --username/--password CLI args)
+for `prices fetch` and `actuals fetch`.
 """
 
 import argparse
@@ -13,6 +21,7 @@ import sqlite3
 import sys
 import time
 import urllib.parse
+from zoneinfo import ZoneInfo
 
 import requests
 import websocket
@@ -25,6 +34,8 @@ COGNITO_CLIENT_ID = "4nre7e2dhlbbmmvh0egegjg4d6"
 COGNITO_REGION = "eu-west-1"
 GRAPHQL_URL = "https://graphql.akamon.cloud/"
 LIVE_BASE = "https://live.pks.fi"
+TENANT_ID = "PKS"
+HELSINKI_TZ = ZoneInfo("Europe/Helsinki")
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
@@ -35,6 +46,142 @@ MAGIC_LINK_QUERY = (
     "  auth { externalMagicLink(tenantId: $tenantId, baseUrl: $baseUrl) { url } }"
     "}"
 )
+
+CUSTOMERSHIPS_QUERY = """query customerships_context_Customerships {
+  endUser {
+    tenancies {
+      tenantId
+      customerIds
+    }
+  }
+}"""
+
+METERING_POINTS_QUERY = """query mp_select_CustomerMeteringPoints(
+  $tenantId: ID!,
+  $customerIdentifier: ID!,
+  $includeFuture: Boolean,
+  $includePast: Boolean
+) {
+  customersByIdentifier(
+    tenantId: $tenantId
+    customerIdentifier: $customerIdentifier
+  ) {
+    customers {
+      identifier
+      externalId
+      meteringpoints(
+        tenantId: $tenantId
+        includeFuture: $includeFuture
+        includePast: $includePast
+      ) {
+        meteringpoints {
+          identifier
+          gsrnIdentifier
+          meteringPointCode
+          type
+          status
+          address {
+            streetName
+            buildingNumber
+            stairwellIdentification
+            apartment
+            addressViewFormShort
+            co
+            postcode
+            cityName
+          }
+        }
+      }
+    }
+  }
+}"""
+
+CONSUMPTION_QUERY = """query energy_usage_GetConsumptionData(
+  $tenantId: ID!,
+  $productIdentifier: ID!,
+  $fuseSize: FuseSizeEnum,
+  $customerId: ID!,
+  $meteringPointId: ID!,
+  $contractType: ContractTypeEnum!,
+  $measurementType: MeasurementType!,
+  $period: ConsumptionRangePeriod!,
+  $periodStart: String!,
+  $periodEnd: String!,
+  $cacheTimeout: String,
+  $skipFirstAndLastAvailable: Boolean,
+  $offsetHours: Int,
+  $isLastAvailableFullDay: Boolean,
+  $includeExternalPrices: Boolean,
+  $resolution: ResolutionDuration!,
+  $consumptionDataResolution: ResolutionDuration,
+  $timezone: String,
+  $readingTypes: [ReadingType!]
+) {
+  consumption {
+    range(
+      tenantId: $tenantId
+      productIdentifier: $productIdentifier
+      fuseSize: $fuseSize
+      customerId: $customerId
+      meteringPointId: $meteringPointId
+      contractType: $contractType
+      measurementType: $measurementType
+      period: $period
+      periodStart: $periodStart
+      periodEnd: $periodEnd
+      cacheTimeout: $cacheTimeout
+      skipFirstAndLastAvailable: $skipFirstAndLastAvailable
+      useOnlyDailySums: true
+      offsetHours: $offsetHours
+      isLastAvailableFullDay: $isLastAvailableFullDay
+      includeExternalPrices: $includeExternalPrices
+    ) {
+      items {
+        startTime
+        endTime
+        sum
+        costWithVat
+        costWithoutVat
+        status
+        unit
+      }
+      firstAvailable
+      lastAvailable
+    }
+    sumTimeSeries(
+      tenantId: $tenantId
+      customerId: $customerId
+      meteringPointId: $meteringPointId
+      contractType: $contractType
+      measurementType: $measurementType
+      resolution: $resolution
+      startDate: $periodStart
+      endDate: $periodEnd
+      consumptionDataResolution: $consumptionDataResolution
+      timezone: $timezone
+      readingTypes: $readingTypes
+    ) {
+      meteringPointIdentifier
+      measurementType
+      resolution
+      timeSeriesUnit
+      sumValues {
+        start
+        stop
+        value
+        valueCount
+        minValue
+        maxValue
+        minValueTime
+        maxValueTime
+        avgValue
+        dayTime
+        nightTime
+        winterDayTime
+      }
+    }
+  }
+}"""
 
 MULTI_TYPE_LABELS = {
     0: "Vuoden 2026 loppuun",
@@ -75,6 +222,42 @@ CREATE TABLE IF NOT EXISTS multi_prices (
     cost_estimate_with_vat REAL
 );
 CREATE INDEX IF NOT EXISTS idx_multi_prices_fetched_at ON multi_prices(fetched_at);
+
+CREATE TABLE IF NOT EXISTS meter_points (
+    metering_point_id  TEXT PRIMARY KEY,
+    customer_id        TEXT NOT NULL,
+    gsrn_identifier    TEXT,
+    type               TEXT,
+    status             TEXT,
+    address            TEXT,
+    first_seen_at      TEXT NOT NULL,
+    last_seen_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS consumption_daily (
+    metering_point_id  TEXT NOT NULL,
+    contract_type      TEXT NOT NULL,
+    period_start       TEXT NOT NULL,
+    period_end         TEXT,
+    sum_kwh            REAL,
+    cost_with_vat      REAL,
+    cost_without_vat   REAL,
+    unit               TEXT,
+    status             INTEGER,
+    day_time_kwh       REAL,
+    night_time_kwh     REAL,
+    winter_day_kwh     REAL,
+    min_value          REAL,
+    min_value_time     TEXT,
+    max_value          REAL,
+    max_value_time     TEXT,
+    avg_value          REAL,
+    value_count        INTEGER,
+    fetched_at         TEXT NOT NULL,
+    PRIMARY KEY (metering_point_id, contract_type, period_start)
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_daily_period_start
+    ON consumption_daily(period_start);
 """
 
 
@@ -94,14 +277,11 @@ def cognito_login(username, password):
     return u.id_token
 
 
-def get_magic_link_url(id_token):
+def graphql_call(id_token, op_name, query, variables, *, debug=False):
     payload = {
-        "operationName": "priima_live_externalMagicLink",
-        "query": MAGIC_LINK_QUERY,
-        "variables": {
-            "tenantId": "PKS",
-            "baseUrl": f"{LIVE_BASE}/Kirjaudu/PKS/Online",
-        },
+        "operationName": op_name,
+        "query": query,
+        "variables": variables,
     }
     headers = {
         "authorization": id_token,
@@ -113,12 +293,131 @@ def get_magic_link_url(id_token):
         "referer": "https://pkslive.pks.fi/",
         "user-agent": USER_AGENT,
     }
+    log(f"  graphql: {op_name}", debug=debug)
     r = requests.post(GRAPHQL_URL, json=payload, headers=headers, timeout=30)
     r.raise_for_status()
     body = r.json()
     if "errors" in body:
-        raise RuntimeError(f"GraphQL errors: {body['errors']}")
-    return body["data"]["auth"]["externalMagicLink"]["url"]
+        raise RuntimeError(f"GraphQL errors on {op_name}: {body['errors']}")
+    return body["data"]
+
+
+def get_magic_link_url(id_token):
+    data = graphql_call(
+        id_token,
+        "priima_live_externalMagicLink",
+        MAGIC_LINK_QUERY,
+        {"tenantId": "PKS", "baseUrl": f"{LIVE_BASE}/Kirjaudu/PKS/Online"},
+    )
+    return data["auth"]["externalMagicLink"]["url"]
+
+
+def fetch_customer_id(id_token, *, debug=False):
+    data = graphql_call(
+        id_token, "customerships_context_Customerships", CUSTOMERSHIPS_QUERY, {},
+        debug=debug,
+    )
+    tenancies = data["endUser"]["tenancies"]
+    for t in tenancies:
+        if t["tenantId"] == TENANT_ID and t["customerIds"]:
+            return t["customerIds"][0]
+    raise RuntimeError(f"No customer found for tenant {TENANT_ID}")
+
+
+def fetch_metering_points(id_token, customer_id, *, debug=False):
+    data = graphql_call(
+        id_token,
+        "mp_select_CustomerMeteringPoints",
+        METERING_POINTS_QUERY,
+        {
+            "tenantId": TENANT_ID,
+            "customerIdentifier": customer_id,
+            "includeFuture": True,
+            "includePast": False,
+        },
+        debug=debug,
+    )
+    customers = data["customersByIdentifier"]["customers"]
+    if not customers:
+        return []
+    mps = customers[0]["meteringpoints"]["meteringpoints"]
+    out = []
+    for mp in mps:
+        addr = mp.get("address") or {}
+        out.append({
+            "metering_point_id": mp["identifier"],
+            "gsrn_identifier": mp.get("gsrnIdentifier"),
+            "type": mp.get("type"),
+            "status": mp.get("status"),
+            "address": addr.get("addressViewFormShort"),
+        })
+    return out
+
+
+def fetch_consumption(
+    id_token, customer_id, metering_point_id, contract_type,
+    period_start_utc, period_end_utc,
+    *, product_identifier="Priima", resolution="P1DT", debug=False,
+):
+    data = graphql_call(
+        id_token,
+        "energy_usage_GetConsumptionData",
+        CONSUMPTION_QUERY,
+        {
+            "tenantId": TENANT_ID,
+            "productIdentifier": product_identifier,
+            "customerId": customer_id,
+            "meteringPointId": metering_point_id,
+            "contractType": contract_type,
+            "measurementType": "ActivePower",
+            "period": "Month",
+            "periodStart": period_start_utc,
+            "periodEnd": period_end_utc,
+            "resolution": resolution,
+            "skipFirstAndLastAvailable": False,
+            "isLastAvailableFullDay": False,
+            "includeExternalPrices": False,
+        },
+        debug=debug,
+    )
+    return data["consumption"]
+
+
+def merge_consumption(consumption):
+    """Merge range.items[] (sum/cost) with sumTimeSeries.sumValues[] (breakdown)
+    keyed by period start."""
+    items = (consumption.get("range") or {}).get("items") or []
+    sums = (consumption.get("sumTimeSeries") or {}).get("sumValues") or []
+    by_start = {}
+    for it in items:
+        by_start[it["startTime"]] = {
+            "period_start": it["startTime"],
+            "period_end": it.get("endTime"),
+            "sum_kwh": it.get("sum"),
+            "cost_with_vat": it.get("costWithVat"),
+            "cost_without_vat": it.get("costWithoutVat"),
+            "status": it.get("status"),
+            "unit": it.get("unit"),
+        }
+    for sv in sums:
+        row = by_start.setdefault(sv["start"], {
+            "period_start": sv["start"], "period_end": sv.get("stop"),
+        })
+        row["period_end"] = row.get("period_end") or sv.get("stop")
+        if row.get("sum_kwh") is None:
+            row["sum_kwh"] = sv.get("value")
+        row.update({
+            "day_time_kwh": sv.get("dayTime"),
+            "night_time_kwh": sv.get("nightTime"),
+            "winter_day_kwh": sv.get("winterDayTime"),
+            "min_value": sv.get("minValue"),
+            "min_value_time": sv.get("minValueTime"),
+            "max_value": sv.get("maxValue"),
+            "max_value_time": sv.get("maxValueTime"),
+            "avg_value": sv.get("avgValue"),
+            "value_count": sv.get("valueCount"),
+        })
+    return sorted(by_start.values(), key=lambda r: r["period_start"])
 
 
 def make_session():
@@ -275,7 +574,7 @@ def open_db(path=DB_PATH):
     return conn
 
 
-def save_to_db(periods, period_prices, multi, fetched_at, db_path=DB_PATH):
+def save_prices_to_db(periods, period_prices, multi, fetched_at, db_path=DB_PATH):
     period_rows = []
     for entry in normalize_period_prices(period_prices):
         pid = entry.get("PeriodId") or entry.get("Id") or entry.get("periodId")
@@ -336,6 +635,93 @@ def save_to_db(periods, period_prices, multi, fetched_at, db_path=DB_PATH):
     return len(period_rows), len(multi_rows)
 
 
+def save_meter_points(meter_points, customer_id, fetched_at, db_path=DB_PATH):
+    rows = [
+        (
+            mp["metering_point_id"],
+            customer_id,
+            mp.get("gsrn_identifier"),
+            mp.get("type"),
+            mp.get("status"),
+            mp.get("address"),
+            fetched_at,
+            fetched_at,
+        )
+        for mp in meter_points
+    ]
+    with open_db(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO meter_points "
+            "(metering_point_id, customer_id, gsrn_identifier, type, status, address, "
+            " first_seen_at, last_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(metering_point_id) DO UPDATE SET "
+            "  customer_id     = excluded.customer_id, "
+            "  gsrn_identifier = excluded.gsrn_identifier, "
+            "  type            = excluded.type, "
+            "  status          = excluded.status, "
+            "  address         = excluded.address, "
+            "  last_seen_at    = excluded.last_seen_at",
+            rows,
+        )
+    return len(rows)
+
+
+def save_consumption(rows, metering_point_id, contract_type, fetched_at, db_path=DB_PATH):
+    db_rows = [
+        (
+            metering_point_id,
+            contract_type,
+            r["period_start"],
+            r.get("period_end"),
+            r.get("sum_kwh"),
+            r.get("cost_with_vat"),
+            r.get("cost_without_vat"),
+            r.get("unit"),
+            r.get("status"),
+            r.get("day_time_kwh"),
+            r.get("night_time_kwh"),
+            r.get("winter_day_kwh"),
+            r.get("min_value"),
+            r.get("min_value_time"),
+            r.get("max_value"),
+            r.get("max_value_time"),
+            r.get("avg_value"),
+            r.get("value_count"),
+            fetched_at,
+        )
+        for r in rows
+    ]
+    with open_db(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO consumption_daily "
+            "(metering_point_id, contract_type, period_start, period_end, sum_kwh, "
+            " cost_with_vat, cost_without_vat, unit, status, day_time_kwh, night_time_kwh, "
+            " winter_day_kwh, min_value, min_value_time, max_value, max_value_time, "
+            " avg_value, value_count, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(metering_point_id, contract_type, period_start) DO UPDATE SET "
+            "  period_end       = excluded.period_end, "
+            "  sum_kwh          = excluded.sum_kwh, "
+            "  cost_with_vat    = excluded.cost_with_vat, "
+            "  cost_without_vat = excluded.cost_without_vat, "
+            "  unit             = excluded.unit, "
+            "  status           = excluded.status, "
+            "  day_time_kwh     = excluded.day_time_kwh, "
+            "  night_time_kwh   = excluded.night_time_kwh, "
+            "  winter_day_kwh   = excluded.winter_day_kwh, "
+            "  min_value        = excluded.min_value, "
+            "  min_value_time   = excluded.min_value_time, "
+            "  max_value        = excluded.max_value, "
+            "  max_value_time   = excluded.max_value_time, "
+            "  avg_value        = excluded.avg_value, "
+            "  value_count      = excluded.value_count, "
+            "  fetched_at       = excluded.fetched_at",
+            db_rows,
+        )
+    return len(db_rows)
+
+
 def fmt_price(v):
     if v is None:
         return "    -   "
@@ -359,7 +745,7 @@ def normalize_period_prices(raw):
     return list(raw)
 
 
-def print_report(periods, period_prices, multi):
+def print_prices_report(periods, period_prices, multi):
     monthly = []
     quarterly = []
     other = []
@@ -422,23 +808,80 @@ def print_report(periods, period_prices, multi):
     print()
 
 
+def print_actuals_report(per_meter, period_start_date, period_end_date):
+    print("=" * 78)
+    print(
+        f"PKS Live — Kulutus    {period_start_date} → {period_end_date}    "
+        f"({time.strftime('%Y-%m-%d %H:%M')})"
+    )
+    print("=" * 78)
+    for entry in per_meter:
+        mp = entry["meter"]
+        rows = entry["rows"]
+        total_kwh = sum((r.get("sum_kwh") or 0) for r in rows)
+        total_cost_vat = sum((r.get("cost_with_vat") or 0) for r in rows)
+        print()
+        print(
+            f"Käyttöpaikka {mp['metering_point_id']}  ({mp.get('type')})  "
+            f"{mp.get('address') or ''}"
+        )
+        print("-" * 78)
+        print(
+            f"  {'Päivä':<12} {'kWh':>8} {'pvä-aika':>10} {'yö-aika':>10} "
+            f"{'€':>9} {'€ (sis. ALV)':>14}"
+        )
+        for r in rows:
+            day = (r.get("period_start") or "")[:10]
+            print(
+                f"  {day:<12} "
+                f"{(r.get('sum_kwh') or 0):>8.2f} "
+                f"{(r.get('day_time_kwh') or 0):>10.2f} "
+                f"{(r.get('night_time_kwh') or 0):>10.2f} "
+                f"{(r.get('cost_without_vat') or 0):>9.3f} "
+                f"{(r.get('cost_with_vat') or 0):>14.3f}"
+            )
+        print("-" * 78)
+        print(
+            f"  Yhteensä {len(rows)} päivää: {total_kwh:.2f} kWh, "
+            f"{total_cost_vat:.2f} € (sis. ALV)"
+        )
+    print()
+
+
 SCHEMA_HINTS = {
     "description": (
-        "PKS Live price-fixing data. Each `pks_prices.py fetch` run inserts one snapshot "
-        "across both tables, tagged with a shared `fetched_at` UTC ISO-8601 timestamp."
+        "PKS Live data. `period_prices`/`multi_prices` hold append-only snapshots of "
+        "price-fixing data (one row per period/bundle per snapshot). `meter_points` and "
+        "`consumption_daily` hold metered actuals, upserted by natural key — re-fetching "
+        "the same date range refreshes the existing rows."
     ),
     "tables": {
         "period_prices": (
-            "One row per period (monthly or quarterly) per snapshot. "
+            "One row per period (monthly or quarterly) per price-fixing snapshot. "
             "period_type 0=monthly, 1=quarterly. price/price_with_vat are snt/kWh."
         ),
         "multi_prices": (
-            "One row per multi-period bundle per snapshot. "
+            "One row per multi-period bundle per price-fixing snapshot. "
             "bundle_type: 0=year-end bundle, 1=next-12-months, 2=next-year, 3=second-half-of-year."
+        ),
+        "meter_points": (
+            "One row per metering point ever observed for this customer. "
+            "Upserted on every `actuals fetch` — `first_seen_at` is preserved, `last_seen_at` "
+            "tracks the latest fetch. `type` is 'Sales' (consumption) or 'SalesProduction' "
+            "(feed-in / production)."
+        ),
+        "consumption_daily": (
+            "One row per (metering_point_id, contract_type, period_start) — daily actuals "
+            "for each metering point. Upsert key means re-fetching a date range refreshes "
+            "values (numbers can be restated by the network company). "
+            "sum_kwh is the daily total in kWh; day_time_kwh / night_time_kwh / winter_day_kwh "
+            "split it by tariff time-of-day. cost_with_vat / cost_without_vat are in EUR. "
+            "period_start is the Helsinki day boundary in UTC (e.g. '2026-05-01T21:00:00Z' = "
+            "midnight Helsinki summer time, '2026-12-01T22:00:00Z' = midnight Helsinki winter time)."
         ),
     },
     "common_queries": {
-        "latest_snapshot": (
+        "latest_price_snapshot": (
             "SELECT * FROM period_prices "
             "WHERE fetched_at = (SELECT MAX(fetched_at) FROM period_prices)"
         ),
@@ -450,6 +893,63 @@ SCHEMA_HINTS = {
             "SELECT fetched_at, period_name, price, "
             "price - LAG(price) OVER (PARTITION BY period_id ORDER BY fetched_at) AS delta "
             "FROM period_prices ORDER BY fetched_at DESC, period_id"
+        ),
+        "total_consumption_last_30_days": (
+            "SELECT metering_point_id, contract_type, "
+            "SUM(sum_kwh) AS kwh, SUM(cost_with_vat) AS eur_with_vat "
+            "FROM consumption_daily "
+            "WHERE period_start >= date('now', '-30 days') "
+            "GROUP BY metering_point_id, contract_type"
+        ),
+        "monthly_consumption_by_meter": (
+            "SELECT metering_point_id, contract_type, "
+            "strftime('%Y-%m', period_start) AS month, "
+            "SUM(sum_kwh) AS kwh, SUM(cost_with_vat) AS eur_with_vat "
+            "FROM consumption_daily "
+            "GROUP BY metering_point_id, contract_type, month "
+            "ORDER BY month DESC"
+        ),
+        "day_vs_night_share": (
+            "SELECT period_start, sum_kwh, day_time_kwh, night_time_kwh, "
+            "ROUND(100.0 * night_time_kwh / sum_kwh, 1) AS night_pct "
+            "FROM consumption_daily WHERE contract_type = 'Sales' "
+            "ORDER BY period_start DESC LIMIT 30"
+        ),
+        "lock_in_vs_last_year_actuals": (
+            "WITH lock AS ("
+            "  SELECT instrument_name, period_start, period_stop, price_with_vat "
+            "  FROM period_prices WHERE instrument_name = ? "
+            "  ORDER BY fetched_at DESC LIMIT 1"
+            "), "
+            "historic AS ("
+            "  SELECT SUM(sum_kwh) AS kwh, SUM(cost_with_vat) AS eur_actual_with_vat, "
+            "         COUNT(*) AS days "
+            "  FROM consumption_daily, lock "
+            "  WHERE contract_type = 'Sales' "
+            "    AND consumption_daily.period_start >= datetime(lock.period_start, '-1 year') "
+            "    AND consumption_daily.period_start <= datetime(lock.period_stop,  '-1 year')"
+            ") "
+            "SELECT lock.instrument_name, "
+            "       date(lock.period_start, '+3 hours') AS lock_starts, "
+            "       date(lock.period_stop)             AS lock_ends, "
+            "       lock.price_with_vat                AS lock_snt_kwh_with_vat, "
+            "       ROUND(historic.kwh, 1)             AS last_year_kwh, "
+            "       ROUND(historic.eur_actual_with_vat, 2) AS last_year_eur_actual, "
+            "       ROUND(historic.kwh * lock.price_with_vat / 100, 2) AS hypothetical_eur_at_lock, "
+            "       ROUND(historic.kwh * lock.price_with_vat / 100 - historic.eur_actual_with_vat, 2) AS delta_eur, "
+            "       ROUND(100.0 * (historic.kwh * lock.price_with_vat / 100 - historic.eur_actual_with_vat) "
+            "             / historic.eur_actual_with_vat, 1) AS delta_pct, "
+            "       historic.days AS days_of_data "
+            "FROM lock, historic"
+        ),
+        "available_lock_in_offers": (
+            "SELECT instrument_name, period_type, price_with_vat, "
+            "       date(period_start, '+3 hours') AS starts, "
+            "       date(period_stop)              AS ends "
+            "FROM period_prices "
+            "WHERE fetched_at = (SELECT MAX(fetched_at) FROM period_prices) "
+            "  AND price IS NOT NULL "
+            "ORDER BY period_start"
         ),
     },
 }
@@ -489,9 +989,23 @@ def cmd_describe(args):
                 for r in conn.execute(f"PRAGMA index_list({t})")
             ]
             row_count = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            mn, mx, runs = conn.execute(
-                f"SELECT MIN(fetched_at), MAX(fetched_at), COUNT(DISTINCT fetched_at) FROM {t}"
-            ).fetchone()
+
+            col_names = {c["name"] for c in cols}
+            timeline_col = (
+                "fetched_at" if "fetched_at" in col_names else
+                "period_start" if "period_start" in col_names else
+                None
+            )
+            mn = mx = runs = None
+            if timeline_col:
+                mn, mx = conn.execute(
+                    f"SELECT MIN({timeline_col}), MAX({timeline_col}) FROM {t}"
+                ).fetchone()
+                if timeline_col == "fetched_at":
+                    runs = conn.execute(
+                        f"SELECT COUNT(DISTINCT {timeline_col}) FROM {t}"
+                    ).fetchone()[0]
+
             sample = None
             r = conn.execute(f"SELECT * FROM {t} ORDER BY rowid DESC LIMIT 1").fetchone()
             if r is not None:
@@ -501,8 +1015,8 @@ def cmd_describe(args):
                 "columns": cols,
                 "indexes": indexes,
                 "row_count": row_count,
-                "earliest_fetched_at": mn,
-                "latest_fetched_at": mx,
+                "earliest": mn,
+                "latest": mx,
                 "snapshot_count": runs,
                 "latest_row": sample,
             }
@@ -519,7 +1033,7 @@ def cmd_query(args):
         print(json.dumps({"ok": False, "error": "empty_sql", "message": "Empty SQL."}))
         sys.exit(1)
     if not pathlib.Path(args.db).exists():
-        print(json.dumps({"ok": False, "error": "db_missing", "message": f"No DB at {args.db} — run `fetch` first."}))
+        print(json.dumps({"ok": False, "error": "db_missing", "message": f"No DB at {args.db} — run `prices fetch` or `actuals fetch` first."}))
         sys.exit(1)
     try:
         with open_db_readonly(args.db) as conn:
@@ -536,6 +1050,9 @@ def cmd_query(args):
 
 
 def cmd_runs(args):
+    if not pathlib.Path(args.db).exists():
+        print(json.dumps({"ok": False, "error": "db_missing", "message": f"No DB at {args.db} — run `prices fetch` first."}))
+        sys.exit(1)
     with open_db_readonly(args.db) as conn:
         conn.row_factory = sqlite3.Row
         rows = list(conn.execute(
@@ -552,7 +1069,7 @@ def cmd_runs(args):
     print(json.dumps({"run_count": len(out), "runs": out}, indent=2, ensure_ascii=False))
 
 
-def build_snapshot_payload(periods, period_prices, multi, fetched_at, db_path, saved):
+def build_prices_payload(periods, period_prices, multi, fetched_at, db_path, saved):
     period_rows = []
     for entry in normalize_period_prices(period_prices):
         pid = entry.get("PeriodId") or entry.get("Id") or entry.get("periodId")
@@ -597,7 +1114,7 @@ def build_snapshot_payload(periods, period_prices, multi, fetched_at, db_path, s
     }
 
 
-def cmd_fetch(args):
+def cmd_prices_fetch(args):
     json_mode = getattr(args, "json", False)
 
     def fail(kind, message):
@@ -646,7 +1163,7 @@ def cmd_fetch(args):
     saved = False
     if not args.no_save:
         try:
-            n_periods, n_multi = save_to_db(
+            n_periods, n_multi = save_prices_to_db(
                 periods, period_prices, multi, fetched_at, db_path=pathlib.Path(args.db)
             )
             saved = True
@@ -660,40 +1177,271 @@ def cmd_fetch(args):
             raise
 
     if json_mode:
-        payload = build_snapshot_payload(
+        payload = build_prices_payload(
             periods, period_prices, multi, fetched_at, args.db, saved
         )
         payload["ok"] = True
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     else:
-        print_report(periods, period_prices, multi)
+        print_prices_report(periods, period_prices, multi)
+
+
+def helsinki_day_start_utc(date_str):
+    d = dt.date.fromisoformat(date_str)
+    local = dt.datetime.combine(d, dt.time(0, 0, 0), tzinfo=HELSINKI_TZ)
+    utc = local.astimezone(dt.timezone.utc)
+    return utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def helsinki_day_end_utc(date_str):
+    d = dt.date.fromisoformat(date_str)
+    local = dt.datetime.combine(d, dt.time(23, 59, 59, 999000), tzinfo=HELSINKI_TZ)
+    utc = local.astimezone(dt.timezone.utc)
+    return utc.strftime("%Y-%m-%dT%H:%M:%S.999Z")
+
+
+def iter_helsinki_months(from_date_iso, to_date_iso):
+    """Yield (period_start_utc, period_end_utc, label) for each Helsinki calendar
+    month that overlaps [from_date_iso, to_date_iso]. Partial first/last months
+    are clipped to the requested range. The API only accepts one month per
+    `energy_usage_GetConsumptionData` call."""
+    start = dt.date.fromisoformat(from_date_iso)
+    end = dt.date.fromisoformat(to_date_iso)
+    cur = start.replace(day=1)
+    while cur <= end:
+        if cur.month == 12:
+            next_month_first = cur.replace(year=cur.year + 1, month=1, day=1)
+        else:
+            next_month_first = cur.replace(month=cur.month + 1, day=1)
+        last_day = next_month_first - dt.timedelta(days=1)
+        clip_start = max(cur, start)
+        clip_end = min(last_day, end)
+        yield (
+            helsinki_day_start_utc(clip_start.isoformat()),
+            helsinki_day_end_utc(clip_end.isoformat()),
+            f"{cur.year}-{cur.month:02d}",
+        )
+        cur = next_month_first
+
+
+def resolve_date_range(args):
+    today_helsinki = dt.datetime.now(HELSINKI_TZ).date()
+    end_date = dt.date.fromisoformat(args.to_date) if args.to_date else today_helsinki
+    if args.from_date:
+        start_date = dt.date.fromisoformat(args.from_date)
+    else:
+        days = args.days if args.days else 30
+        start_date = end_date - dt.timedelta(days=days)
+    if start_date > end_date:
+        raise ValueError(f"--from ({start_date}) is after --to ({end_date})")
+    return start_date.isoformat(), end_date.isoformat()
+
+
+def cmd_actuals_fetch(args):
+    json_mode = getattr(args, "json", False)
+
+    def fail(kind, message):
+        if json_mode:
+            print(json.dumps({"ok": False, "error": kind, "message": message}, ensure_ascii=False))
+        else:
+            print(f"ERROR ({kind}): {message}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.username or not args.password:
+        fail(
+            "missing_credentials",
+            "Set PKS_USERNAME and PKS_PASSWORD in .env or pass --username/--password.",
+        )
+
+    try:
+        from_date, to_date = resolve_date_range(args)
+    except ValueError as e:
+        fail("bad_args", str(e))
+
+    try:
+        log("[1/4] Cognito SRP login…", debug=args.debug)
+        id_token = cognito_login(args.username, args.password)
+
+        log("[2/4] Fetching customer id…", debug=args.debug)
+        customer_id = fetch_customer_id(id_token, debug=args.debug)
+        log(f"        customer_id={customer_id}", debug=args.debug)
+
+        log("[3/4] Fetching metering points…", debug=args.debug)
+        meter_points = fetch_metering_points(id_token, customer_id, debug=args.debug)
+        if args.metering_point:
+            meter_points = [m for m in meter_points if m["metering_point_id"] == args.metering_point]
+            if not meter_points:
+                fail("bad_args", f"Metering point {args.metering_point} not found.")
+        log(
+            f"        {len(meter_points)} metering point(s): "
+            + ", ".join(f"{m['metering_point_id']}({m['type']})" for m in meter_points),
+            debug=args.debug,
+        )
+
+        months = list(iter_helsinki_months(from_date, to_date))
+        log(
+            f"[4/4] Fetching consumption {from_date}…{to_date} "
+            f"({len(months)} month(s) × {len(meter_points)} meter(s), "
+            f"resolution={args.resolution}, product={args.product_identifier})…",
+            debug=args.debug,
+        )
+        per_meter = []
+        for mp in meter_points:
+            rows_by_start = {}
+            for month_start_utc, month_end_utc, label in months:
+                log(
+                    f"        {mp['metering_point_id']} {label}…",
+                    debug=args.debug,
+                )
+                consumption = fetch_consumption(
+                    id_token,
+                    customer_id,
+                    mp["metering_point_id"],
+                    mp["type"],
+                    month_start_utc,
+                    month_end_utc,
+                    product_identifier=args.product_identifier,
+                    resolution=args.resolution,
+                    debug=args.debug,
+                )
+                for row in merge_consumption(consumption):
+                    rows_by_start[row["period_start"]] = row
+            rows = sorted(rows_by_start.values(), key=lambda r: r["period_start"])
+            per_meter.append({"meter": mp, "rows": rows})
+            log(
+                f"        {mp['metering_point_id']}: {len(rows)} rows total",
+                debug=args.debug,
+            )
+    except Exception as e:
+        kind = type(e).__name__
+        if "Cognito" in kind or "InitiateAuth" in str(e) or "UserNotFound" in kind:
+            fail("auth_failed", f"{kind}: {e}")
+        fail("fetch_failed", f"{kind}: {e}")
+
+    fetched_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    saved = False
+    total_rows = 0
+    if not args.no_save:
+        try:
+            save_meter_points(
+                meter_points, customer_id, fetched_at, db_path=pathlib.Path(args.db)
+            )
+            for entry in per_meter:
+                mp = entry["meter"]
+                n = save_consumption(
+                    entry["rows"],
+                    mp["metering_point_id"],
+                    mp["type"],
+                    fetched_at,
+                    db_path=pathlib.Path(args.db),
+                )
+                total_rows += n
+            saved = True
+            log(
+                f"      saved/updated {total_rows} consumption rows + "
+                f"{len(meter_points)} meter point(s) to {args.db}",
+                debug=args.debug,
+            )
+        except Exception as e:
+            if json_mode:
+                fail("db_write_failed", f"{type(e).__name__}: {e}")
+            raise
+
+    if json_mode:
+        payload = {
+            "ok": True,
+            "fetched_at": fetched_at,
+            "saved_to_db": saved,
+            "db_path": str(args.db) if saved else None,
+            "from_date": from_date,
+            "to_date": to_date,
+            "resolution": args.resolution,
+            "customer_id": customer_id,
+            "meters": per_meter,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        print_actuals_report(per_meter, from_date, to_date)
 
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        description="PKS Live price fetcher and SQLite history store.",
+        description="PKS Live data fetcher and local SQLite store.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Subcommands:\n"
-            "  fetch     (default) Log in, fetch current prices, persist, print report\n"
-            "  describe  Emit DB schema as JSON (for agents)\n"
-            "  query     Run a read-only SQL query, output JSON rows\n"
-            "  runs      List historical snapshots and their row counts\n"
+            "  prices fetch      Log in, pull price-fixings, persist snapshot, print report\n"
+            "  actuals fetch     Pull metered consumption history and upsert into DB\n"
+            "  describe          Emit DB schema as JSON (for agents)\n"
+            "  query             Run a read-only SQL query, output JSON rows\n"
+            "  runs              List historical price-fixing snapshots\n"
         ),
     )
-    ap.add_argument("--db", default=os.environ.get("PKS_DB_PATH", str(DB_PATH)),
-                    help="SQLite path (default: %(default)s)")
-    sub = ap.add_subparsers(dest="cmd")
+    ap.add_argument(
+        "--db",
+        default=os.environ.get("PKS_DB_PATH", str(DB_PATH)),
+        help="SQLite path (default: %(default)s)",
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
 
-    ap_fetch = sub.add_parser("fetch", help="Fetch current prices and persist to DB")
-    ap_fetch.add_argument("--username", default=os.environ.get("PKS_USERNAME"))
-    ap_fetch.add_argument("--password", default=os.environ.get("PKS_PASSWORD"))
-    ap_fetch.add_argument("--tube-type", type=int,
-                          default=int(os.environ.get("PKS_TUBE_TYPE", "1")))
-    ap_fetch.add_argument("--no-save", action="store_true", help="Skip writing to SQLite")
-    ap_fetch.add_argument("--json", action="store_true",
-                          help="Emit a structured JSON snapshot instead of the human report")
-    ap_fetch.add_argument("--debug", action="store_true")
+    ap_prices = sub.add_parser("prices", help="Price-fixing snapshot commands")
+    prices_sub = ap_prices.add_subparsers(dest="action", required=True)
+    ap_prices_fetch = prices_sub.add_parser(
+        "fetch", help="Fetch current prices and persist a snapshot"
+    )
+    ap_prices_fetch.add_argument("--username", default=os.environ.get("PKS_USERNAME"))
+    ap_prices_fetch.add_argument("--password", default=os.environ.get("PKS_PASSWORD"))
+    ap_prices_fetch.add_argument(
+        "--tube-type", type=int, default=int(os.environ.get("PKS_TUBE_TYPE", "1"))
+    )
+    ap_prices_fetch.add_argument(
+        "--no-save", action="store_true", help="Skip writing to SQLite"
+    )
+    ap_prices_fetch.add_argument(
+        "--json", action="store_true",
+        help="Emit a structured JSON snapshot instead of the human report",
+    )
+    ap_prices_fetch.add_argument("--debug", action="store_true")
+
+    ap_actuals = sub.add_parser("actuals", help="Metered consumption commands")
+    actuals_sub = ap_actuals.add_subparsers(dest="action", required=True)
+    ap_actuals_fetch = actuals_sub.add_parser(
+        "fetch", help="Fetch metered consumption and upsert into DB"
+    )
+    ap_actuals_fetch.add_argument("--username", default=os.environ.get("PKS_USERNAME"))
+    ap_actuals_fetch.add_argument("--password", default=os.environ.get("PKS_PASSWORD"))
+    ap_actuals_fetch.add_argument(
+        "--from", dest="from_date",
+        help="Start date YYYY-MM-DD (Helsinki). Default: --to minus --days.",
+    )
+    ap_actuals_fetch.add_argument(
+        "--to", dest="to_date",
+        help="End date YYYY-MM-DD (Helsinki). Default: today.",
+    )
+    ap_actuals_fetch.add_argument(
+        "--days", type=int, default=None,
+        help="When --from is not given, fetch this many days back from --to (default 30).",
+    )
+    ap_actuals_fetch.add_argument(
+        "--resolution", default="P1DT",
+        help="ISO-8601 duration. P1DT (daily, default), PT1H (hourly), PT15M (15-min).",
+    )
+    ap_actuals_fetch.add_argument(
+        "--metering-point",
+        help="Limit to one metering point id (default: all the customer has).",
+    )
+    ap_actuals_fetch.add_argument(
+        "--product-identifier", default="Priima",
+        help="Product identifier on the contract (default: Priima).",
+    )
+    ap_actuals_fetch.add_argument(
+        "--no-save", action="store_true", help="Skip writing to SQLite"
+    )
+    ap_actuals_fetch.add_argument(
+        "--json", action="store_true",
+        help="Emit a structured JSON snapshot instead of the human report",
+    )
+    ap_actuals_fetch.add_argument("--debug", action="store_true")
 
     sub.add_parser("describe", help="Emit DB schema as JSON")
 
@@ -701,26 +1449,33 @@ def build_parser():
     ap_query.add_argument("sql", help="SQL string (use ? placeholders for params)")
     ap_query.add_argument("params", nargs="*", help="Positional bindings for ? placeholders")
 
-    sub.add_parser("runs", help="List all historical snapshots")
+    sub.add_parser("runs", help="List all historical price-fixing snapshots")
 
     return ap
+
+
+DISPATCH = {
+    ("prices", "fetch"): cmd_prices_fetch,
+    ("actuals", "fetch"): cmd_actuals_fetch,
+}
 
 
 def main():
     load_dotenv(dotenv_path=pathlib.Path(__file__).resolve().parent / ".env")
     ap = build_parser()
+    args = ap.parse_args()
 
-    argv = sys.argv[1:]
-    known_subs = {"fetch", "describe", "query", "runs"}
-    help_flags = {"-h", "--help"}
-    has_sub = any(a in known_subs for a in argv)
-    has_help = any(a in help_flags for a in argv)
-    if not has_sub and not has_help:
-        argv = ["fetch", *argv]
-
-    args = ap.parse_args(argv)
-    cmd = args.cmd or "fetch"
-    {"fetch": cmd_fetch, "describe": cmd_describe, "query": cmd_query, "runs": cmd_runs}[cmd](args)
+    if args.cmd == "describe":
+        cmd_describe(args)
+    elif args.cmd == "query":
+        cmd_query(args)
+    elif args.cmd == "runs":
+        cmd_runs(args)
+    else:
+        handler = DISPATCH.get((args.cmd, args.action))
+        if handler is None:
+            ap.error(f"Unknown command: {args.cmd} {args.action}")
+        handler(args)
 
 
 if __name__ == "__main__":

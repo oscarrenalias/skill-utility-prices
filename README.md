@@ -1,8 +1,8 @@
 # skill-utility-prices
 
-An agent skill that pulls electricity contract price-fixing data ("hintakiinnitys") from [PKS Live](https://pkslive.pks.fi), and persists every fetch as a snapshot in a local SQLite database, so an agent can both read the current prices and analyse how they have moved over time. 
+An agent skill that pulls two kinds of data from [PKS Live](https://pkslive.pks.fi) — electricity contract **price-fixings** ("hintakiinnitys") and **metered consumption / actuals** — and persists each fetch to a local SQLite database, so an agent can read current state and analyse how things have moved over time.
 
-The purpose of the skill is to facilitate integration with an agent or personal assistant such as OpenClaw, for example to retrieve the price once a day, analyze historical data, and set alerts. While some of this functionality is provided by the official site, the convenience of integration with an agent is far superior.
+The purpose of the skill is to facilitate integration with an agent or personal assistant such as OpenClaw, for example to retrieve prices and consumption once a day, analyze historical data, and set alerts. While some of this functionality is provided by the official site, the convenience of integration with an agent is far superior.
 
 Designed for one user with one PKS contract, running on a personal machine, ideally on a daily cron.
 
@@ -12,14 +12,15 @@ This skill has been fully vibe coded by Claude Code, which was provided with a t
 
 ### utility-prices
 
-Wraps a small Python CLI (`pks_prices.py`) with four subcommands:
+Wraps a small Python CLI (`pks_prices.py`) with five subcommands:
 
 | Subcommand | What it does |
 |---|---|
-| `fetch` | Logs in (Cognito SRP → GraphQL magic link → legacy session cookies), pulls multi-period bundle prices over REST and monthly/quarterly period prices over SignalR, persists a snapshot, and prints a Finnish-language report. With `--json`, returns structured data instead. |
+| `prices fetch` | Logs in (Cognito SRP → GraphQL magic link → legacy session cookies), pulls multi-period bundle prices over REST and monthly/quarterly period prices over SignalR, **appends** a snapshot, and prints a Finnish-language report. With `--json`, returns structured data instead. |
+| `actuals fetch` | Logs in (Cognito SRP only), discovers customer + metering points via GraphQL, fetches daily consumption for the requested date range (default: last 30 days), and **upserts** rows keyed by `(metering_point_id, contract_type, period_start)`. Captures kWh, EUR cost, day/night/winter-day breakdown, and per-day min/max/avg. With `--json`, returns structured data instead. |
 | `describe` | Emits the SQLite schema as JSON — tables, columns, indexes, row counts, snapshot date range, sample rows, and ready-to-run query templates. The agent's discovery entry point. |
 | `query "<SQL>" [params…]` | Runs a read-only SQL query (DB opened with `mode=ro`) and returns rows as JSON. Supports `?` placeholders for parameter binding. |
-| `runs` | Lists every historical snapshot with per-table row counts. |
+| `runs` | Lists every historical price-fixing snapshot with per-table row counts. Actuals are not snapshotted (they're upserted), so they don't appear here. |
 
 All non-interactive subcommands emit JSON on stdout, with structured error envelopes (`{"ok": false, "error": "<kind>", "message": "..."}`) and non-zero exit codes on failure.
 
@@ -58,4 +59,5 @@ After that, the agent invokes the skill via `uv run python pks_prices.py …`. T
 
 - **Only email + password Cognito accounts are supported.** PKS users who authenticate via TELIA-IBS (Finnish bank ID / Mobiilivarmenne) do not have a Cognito-direct password and the SRP login will fail with `UserNotFoundException`. Driving the federated OIDC flow is not in scope.
 - **Single tenant.** Constants like the Cognito user pool, GraphQL endpoint, and default tube type are hardcoded.
-- **Reverse-engineered transport.** The legacy site uses classic ASP.NET SignalR over WebSocket (clientProtocol 1.5) for live monthly/quarterly prices; the script implements the protocol directly. If the protocol or the page markup that exposes the user ID changes, the relevant step will need a fix.
+- **Reverse-engineered transport.** The legacy site (used by `prices fetch`) uses classic ASP.NET SignalR over WebSocket (clientProtocol 1.5) for live monthly/quarterly prices; the script implements the protocol directly. If the protocol or the page markup that exposes the user ID changes, the relevant step will need a fix. `actuals fetch` uses the modern GraphQL API and is more robust.
+- **Daily granularity for actuals.** The `consumption_daily` table is daily-shaped. The GraphQL API supports finer resolutions (`PT1H`, `PT15M`) but only the daily aggregates are persisted today.
